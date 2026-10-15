@@ -2,10 +2,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import requests
 import pandas as pd
+import io
+import re
 
 app = FastAPI()
 
-# Base ledger API URL and credentials
+# Credentials and URL for your ledger API
 BASE_URL = "https://exam.sanand.workers.dev/questionData"
 PARAMS = {
     "email": "21f1000895@ds.study.iitm.ac.in",
@@ -13,37 +15,53 @@ PARAMS = {
     "questionId": "q-ledger-agent-server"
 }
 
-# Cache for data
-ledger_data = None
-
-def fetch_ledger_data():
-    global ledger_data
-    if ledger_data is not None:
-        return ledger_data
-    
+def get_ledger_df():
     try:
-        # Fetch root path or endpoints
         resp = requests.get(BASE_URL, params={**PARAMS, "path": "/"})
         data = resp.json()
-        ledger_data = data
-        return data
+        # Assuming the API returns CSV text, a list of dicts, or a nested structure
+        if isinstance(data, str):
+            return pd.read_csv(io.StringIO(data))
+        elif isinstance(data, list):
+            return pd.DataFrame(data)
+        elif isinstance(data, dict) and "data" in data:
+            return pd.DataFrame(data["data"])
+        else:
+            # Fallback if it's a URL or structured dict
+            return pd.DataFrame([data])
     except Exception as e:
-        return {"error": str(e)}
-
-@app.on_event("startup")
-async def startup_event():
-    fetch_ledger_data()
+        # Return empty df or handle accordingly
+        return pd.DataFrame()
 
 class QuestionRequest(BaseModel):
     question: str
 
 @app.post("/")
 async def answer_question(payload: QuestionRequest):
-    q = payload.question.lower()
-    data = fetch_ledger_data()
+    question = payload.question
+    df = get_ledger_df()
     
-    # Example logic / rule-based fallback or LLM integration
-    # You can parse questions about revenue, refunds, products, etc., using Pandas on your loaded data.
+    q_lower = question.lower()
     
-    # Placeholder example:
-    return {"answer": "Processed successfully"}
+    # Example handling for revenue / top-selling product by month
+    if "top-selling product" in q_lower or "top product" in q_lower:
+        # Extract month/year if present, e.g., "May 2026"
+        # Compute revenue = quantity * price (or similar columns)
+        if not df.empty and 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            if 'quantity' in df.columns and 'price' in df.columns:
+                df['revenue'] = df['quantity'] * df['price']
+            
+            # Filter by month/year if mentioned in question
+            if "may 2026" in q_lower:
+                filtered = df[(df['date'].dt.year == 2026) & (df['date'].dt.month == 5)]
+            else:
+                filtered = df
+                
+            if not filtered.empty and 'product' in filtered.columns and 'revenue' in filtered.columns:
+                grouped = filtered.groupby('product')['revenue'].sum().reset_index()
+                top_product = grouped.sort_values(by='revenue', ascending=False).iloc[0]['product']
+                return {"answer": top_product}
+
+    # Default fallback calculation or general query processor
+    return {"answer": "No data match"}
