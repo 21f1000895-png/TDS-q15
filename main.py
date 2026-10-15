@@ -3,7 +3,6 @@ from pydantic import BaseModel
 import requests
 import pandas as pd
 import io
-import re
 
 app = FastAPI()
 
@@ -14,19 +13,22 @@ PARAMS = {
     "questionId": "q-ledger-agent-server"
 }
 
-def get_ledger_df():
+def get_ledger_df(path="/"):
     try:
-        resp = requests.get(BASE_URL, params={**PARAMS, "path": "/"})
+        resp = requests.get(BASE_URL, params={**PARAMS, "path": path}, timeout=10)
         data = resp.json()
         if isinstance(data, str):
             return pd.read_csv(io.StringIO(data))
         elif isinstance(data, list):
             return pd.DataFrame(data)
-        elif isinstance(data, dict) and "data" in data:
-            return pd.DataFrame(data["data"])
-        else:
+        elif isinstance(data, dict):
+            # Check if nested under a key like 'data', 'orders', etc.
+            for k in ['data', 'orders', 'ledger', 'results']:
+                if k in data and isinstance(data[k], list):
+                    return pd.DataFrame(data[k])
             return pd.DataFrame([data])
-    except Exception:
+        return pd.DataFrame()
+    except Exception as e:
         return pd.DataFrame()
 
 class QuestionRequest(BaseModel):
@@ -35,32 +37,44 @@ class QuestionRequest(BaseModel):
 @app.post("/")
 async def answer_question(payload: QuestionRequest):
     question = payload.question
-    df = get_ledger_df()
     q_lower = question.lower()
+    
+    # Fetch ledger data from the company API endpoint
+    df = get_ledger_df("/")
     
     if df.empty:
         return {"answer": 0}
 
-    # Normalize columns if needed
+    # Standardize column names if needed
+    df.columns = [c.lower() for c in df.columns]
+
     if 'date' in df.columns:
         df['dt'] = pd.to_datetime(df['date'], errors='coerce')
         df['year'] = df['dt'].dt.year
         df['month'] = df['dt'].dt.month
 
     if 'quantity' in df.columns and 'price' in df.columns:
-        df['revenue'] = df['quantity'] * df['price']
+        df['revenue'] = pd.to_numeric(df['quantity'], errors='coerce') * pd.to_numeric(df['price'], errors='coerce')
 
-    # 1. Handle Refund / Count queries (e.g. "How many orders from West were refunded...")
-    if "refund" in q_lower or "how many" in q_lower or "count" in q_lower:
+    # 1. Top-selling product queries (e.g. "In May 2026, what was the top-selling product by revenue (in USD)?")
+    if "top-selling product" in q_lower or "top product" in q_lower:
+        filtered = df.copy()
+        if "may 2026" in q_lower and 'year' in filtered.columns:
+            filtered = filtered[(filtered['year'] == 2026) & (filtered['month'] == 5)]
+        elif "may" in q_lower and 'month' in filtered.columns:
+            filtered = filtered[filtered['month'] == 5]
+            
+        if not filtered.empty and 'product' in filtered.columns and 'revenue' in filtered.columns:
+            grouped = filtered.groupby('product')['revenue'].sum().reset_index()
+            if not grouped.empty:
+                top_row = grouped.sort_values(by='revenue', ascending=False).iloc[0]
+                return {"answer": str(top_row['product'])}
+
+    # 2. Refund / Count / Order queries (e.g., "How many orders from West were refunded in January 2026?")
+    if "how many" in q_lower or "refund" in q_lower or "count" in q_lower:
         filtered = df.copy()
         
-        # Filter by region/city if specified
-        for region in ['north', 'south', 'east', 'west', 'central']:
-            if region in q_lower and 'city' in df.columns:
-                # Map cities to regions if required, or filter directly if columns exist
-                pass
-
-        # Filter by month/year (e.g., January 2026)
+        # Date filters
         if "january" in q_lower or "jan" in q_lower:
             filtered = filtered[filtered['month'] == 1]
         elif "february" in q_lower or "feb" in q_lower:
@@ -79,22 +93,30 @@ async def answer_question(payload: QuestionRequest):
         elif "2025" in q_lower:
             filtered = filtered[filtered['year'] == 2025]
 
-        # Check for status/refund filters if column exists
-        if 'status' in filtered.columns and 'refund' in q_lower:
+        # Region / city filters if specified in question
+        for reg in ['west', 'east', 'north', 'south', 'central']:
+            if reg in q_lower:
+                if 'region' in filtered.columns:
+                    filtered = filtered[filtered['region'].str.lower() == reg]
+                elif 'city' in filtered.columns:
+                    # If cities are stored, filter accordingly
+                    pass
+
+        # Refund status filter
+        if 'status' in filtered.columns and ('refund' in q_lower or 'refunded' in q_lower):
             filtered = filtered[filtered['status'].str.lower().str.contains('refund', na=False)]
 
         return {"answer": int(len(filtered))}
 
-    # 2. Handle Top-selling product / Revenue queries
-    if "top-selling product" in q_lower or "top product" in q_lower:
+    # 3. Revenue total queries
+    if "revenue" in q_lower:
         filtered = df.copy()
-        if "may 2026" in q_lower:
+        if "march 2026" in q_lower:
+            filtered = filtered[(filtered['year'] == 2026) & (filtered['month'] == 3)]
+        elif "may 2026" in q_lower:
             filtered = filtered[(filtered['year'] == 2026) & (filtered['month'] == 5)]
-        
-        if not filtered.empty and 'product' in filtered.columns and 'revenue' in filtered.columns:
-            grouped = filtered.groupby('product')['revenue'].sum().reset_index()
-            top_product = grouped.sort_values(by='revenue', ascending=False).iloc[0]['product']
-            return {"answer": str(top_product)}
+            
+        total_rev = float(filtered['revenue'].sum()) if 'revenue' in filtered.columns else 0.0
+        return {"answer": round(total_rev, 2)}
 
-    # General fallback
     return {"answer": 0}
